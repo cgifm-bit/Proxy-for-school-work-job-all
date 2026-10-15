@@ -90,11 +90,11 @@ install_dependencies() {
 
     if ! command -v microsocks &>/dev/null; then
         case "${PKG_MANAGER}" in
-            apt) sudo apt-get install -y build-essential ;;
-            dnf) sudo dnf install -y gcc gcc-c++ make ;;
-            pacman) sudo pacman -S --noconfirm base-devel ;;
-            zypper) sudo zypper install -y gcc gcc-c++ make ;;
-            apk) sudo apk add build-base ;;
+            apt) sudo apt-get install -y build-essential unzip ;;
+            dnf) sudo dnf install -y gcc gcc-c++ make unzip ;;
+            pacman) sudo pacman -S --noconfirm base-devel unzip ;;
+            zypper) sudo zypper install -y gcc gcc-c++ make unzip ;;
+            apk) sudo apk add build-base unzip ;;
         esac
 
         TEMP_DIR=$(mktemp -d)
