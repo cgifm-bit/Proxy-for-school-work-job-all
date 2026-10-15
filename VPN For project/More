@@ -1,0 +1,618 @@
+#!/bin/bash
+set -euo pipefail
+
+# ============================================================
+# Multi VPN Proxy System - Single File
+# Save as: multi-vpn-proxy.sh
+# Usage:
+#   chmod +x multi-vpn-proxy.sh
+#   sudo ./multi-vpn-proxy.sh install
+#   sudo ./multi-vpn-proxy.sh start
+# ============================================================
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VPN_DIR="/usr/local/bin/ovpn"
+LOG_DIR="/var/log/protonvpn"
+RUN_DIR="/var/run"
+CONFIG_FILE="${VPN_DIR}/vpn-config.conf"
+OVPN_DIR="${PROJECT_DIR}/ovpn"
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+mkdir -p "${LOG_DIR}" /etc/iproute2
+
+if [ ! -f /etc/iproute2/rt_tables ]; then
+    echo "255     local
+254     main
+253     default
+0       unspec" > /etc/iproute2/rt_tables
+fi
+
+log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
+log_success() { echo -e "${GREEN}[OK]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+
+detect_distro() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        DISTRO="${ID}"
+        DISTRO_VERSION="${VERSION_ID}"
+    elif [ -f /etc/lsb-release ]; then
+        . /etc/lsb-release
+        DISTRO="${DISTRIB_ID}"
+        DISTRO_VERSION="${DISTRIB_RELEASE}"
+    else
+        log_error "No se pudo detectar la distribución"
+        exit 1
+    fi
+
+    if command -v apt-get &>/dev/null; then
+        PKG_MANAGER="apt"
+    elif command -v dnf &>/dev/null; then
+        PKG_MANAGER="dnf"
+    elif command -v pacman &>/dev/null; then
+        PKG_MANAGER="pacman"
+    elif command -v zypper &>/dev/null; then
+        PKG_MANAGER="zypper"
+    elif command -v apk &>/dev/null; then
+        PKG_MANAGER="apk"
+    else
+        log_error "Gestor de paquetes no soportado"
+        exit 1
+    fi
+}
+
+install_dependencies() {
+    case "${PKG_MANAGER}" in
+        apt)
+            sudo apt-get update || true
+            sudo apt-get install -y openvpn curl iproute2 iptables net-tools || true
+            ;;
+        dnf)
+            sudo dnf install -y openvpn curl iproute iptables net-tools || true
+            ;;
+        pacman)
+            sudo pacman -S --noconfirm openvpn curl iproute2 iptables || true
+            ;;
+        zypper)
+            sudo zypper install -y openvpn curl iproute2 iptables || true
+            ;;
+        apk)
+            sudo apk add openvpn curl iproute2 iptables || true
+            ;;
+    esac
+
+    if ! command -v microsocks &>/dev/null; then
+        case "${PKG_MANAGER}" in
+            apt) sudo apt-get install -y build-essential unzip ;;
+            dnf) sudo dnf install -y gcc gcc-c++ make unzip ;;
+            pacman) sudo pacman -S --noconfirm base-devel unzip ;;
+            zypper) sudo zypper install -y gcc gcc-c++ make unzip ;;
+            apk) sudo apk add build-base unzip ;;
+        esac
+
+        TEMP_DIR=$(mktemp -d)
+        cd "${TEMP_DIR}"
+        curl -fsSL https://github.com/rofl0r/microsocks/archive/refs/heads/master.zip -o microsocks.zip || { log_error "No se pudo descargar microsocks"; exit 1; }
+        unzip -q microsocks.zip || { log_error "No se pudo descomprimir microsocks"; exit 1; }
+        cd microsocks-*
+        make
+        sudo make install
+        cd "${PROJECT_DIR}"
+        rm -rf "${TEMP_DIR}"
+    fi
+}
+
+cleanup_system() {
+    sudo pkill -f openvpn 2>/dev/null || true
+    sudo pkill -f microsocks 2>/dev/null || true
+
+    for i in $(seq 100 111); do
+        sudo userdel "vpnuser${i}" 2>/dev/null || true
+        local PROXY_UID=$((3000 + i))
+        sudo ip rule del uidrange ${PROXY_UID}-${PROXY_UID} 2>/dev/null || true
+        sudo ip rule del fwmark ${i} 2>/dev/null || true
+        sudo ip route flush table ${i} 2>/dev/null || true
+    done
+
+    sudo rm -rf "${VPN_DIR}"/* 2>/dev/null || true
+    sudo rm -rf "${LOG_DIR}"/* 2>/dev/null || true
+    sudo rm -f "${RUN_DIR}"/openvpn-*.pid 2>/dev/null || true
+    sudo rm -f "${RUN_DIR}"/microsocks-*.pid 2>/dev/null || true
+    sudo rm -f /etc/protonvpn/vpn-config.conf 2>/dev/null || true
+}
+
+setup_directories() {
+    sudo mkdir -p "${VPN_DIR}" "${LOG_DIR}" /etc/iproute2
+
+    local TABLES=("100 usa" "101 netherlands" "102 switzerland" "103 mexico" "104 japan" "105 canada" "106 us2" "107 us3" "108 us4" "109 mx2" "110 us5" "111 nl2")
+    for TABLE_ENTRY in "${TABLES[@]}"; do
+        if ! grep -q "^${TABLE_ENTRY}" /etc/iproute2/rt_tables 2>/dev/null; then
+            echo "${TABLE_ENTRY}" | sudo tee -a /etc/iproute2/rt_tables >/dev/null
+        fi
+    done
+}
+
+integrate_credentials() {
+    if [ ! -d "${OVPN_DIR}" ]; then
+        log_error "No existe ${OVPN_DIR}. Coloca tus .ovpn y credentials*.txt dentro de esa carpeta."
+        exit 1
+    fi
+
+    CRED_COUNT=$(ls -1 "${OVPN_DIR}"/credentials*.txt 2>/dev/null | wc -l)
+    OVPN_COUNT=$(ls -1 "${OVPN_DIR}"/*.ovpn 2>/dev/null | wc -l)
+
+    if [ "${OVPN_COUNT}" -eq 0 ]; then
+        log_error "No se encontraron archivos .ovpn en ${OVPN_DIR}"
+        exit 1
+    fi
+    if [ "${CRED_COUNT}" -eq 0 ]; then
+        log_error "No se encontraron archivos credentials*.txt en ${OVPN_DIR}"
+        exit 1
+    fi
+
+    sudo mkdir -p "${VPN_DIR}"
+    sudo cp "${OVPN_DIR}"/*.ovpn "${VPN_DIR}/"
+    sudo cp "${OVPN_DIR}"/credentials*.txt "${VPN_DIR}/"
+    sudo chmod 600 "${VPN_DIR}"/credentials*.txt
+
+    OVPN_FILES=($(ls -1 "${VPN_DIR}"/*.ovpn))
+    for i in "${!OVPN_FILES[@]}"; do
+        OVPN_FILE="${OVPN_FILES[$i]}"
+        CRED_INDEX=$(( (i / 2) + 1 ))
+
+        case "${CRED_INDEX}" in
+            1) CRED_FILE="credentials.txt" ;;
+            2) CRED_FILE="credentials-2.txt" ;;
+            3) CRED_FILE="credentials-3.txt" ;;
+            *) CRED_FILE="credentials-${CRED_INDEX}.txt" ;;
+        esac
+
+        if [ ! -f "${VPN_DIR}/${CRED_FILE}" ]; then
+            CRED_FILE="credentials.txt"
+        fi
+
+        sudo sed -i '/^auth-user-pass/d' "${OVPN_FILE}"
+        echo "auth-user-pass ${VPN_DIR}/${CRED_FILE}" | sudo tee -a "${OVPN_FILE}" >/dev/null
+    done
+}
+
+create_users() {
+    for i in $(seq 100 111); do
+        PROXY_UID=$((3000 + i))
+        if ! id "vpnuser${i}" &>/dev/null; then
+            sudo useradd -r -s /bin/false -u "${PROXY_UID}" "vpnuser${i}" 2>/dev/null || true
+        fi
+    done
+}
+
+declare -gA VPN_SERVERS
+declare -g VPN_ORDER=()
+
+discover_vpn_servers() {
+    if [ ! -d "${VPN_DIR}" ]; then
+        echo -e "${RED}ERROR: Directorio ${VPN_DIR} no existe${NC}"
+        exit 1
+    fi
+
+    if [ -f "${VPN_DIR}/us-free-67.protonvpn.udp.ovpn" ]; then
+        VPN_SERVERS["usa"]="1080:100:tun0:us-free-67.protonvpn.udp.ovpn::"
+        VPN_ORDER+=("usa")
+    fi
+    if [ -f "${VPN_DIR}/nl-free-244.protonvpn.udp.ovpn" ]; then
+        VPN_SERVERS["netherlands"]="1081:101:tun1:nl-free-244.protonvpn.udp.ovpn::"
+        VPN_ORDER+=("netherlands")
+    fi
+    if [ -f "${VPN_DIR}/ch-free-9.protonvpn.udp.ovpn" ]; then
+        VPN_SERVERS["switzerland"]="1082:102:tun2:ch-free-9.protonvpn.udp.ovpn::"
+        VPN_ORDER+=("switzerland")
+    fi
+    if [ -f "${VPN_DIR}/mx-free-8.protonvpn.udp.ovpn" ]; then
+        VPN_SERVERS["mexico"]="1083:103:tun3:mx-free-8.protonvpn.udp.ovpn::"
+        VPN_ORDER+=("mexico")
+    fi
+    if [ -f "${VPN_DIR}/jp-free-3.protonvpn.udp.ovpn" ]; then
+        VPN_SERVERS["japan"]="1084:104:tun4:jp-free-3.protonvpn.udp.ovpn::"
+        VPN_ORDER+=("japan")
+    fi
+    if [ -f "${VPN_DIR}/ca-free-14.protonvpn.udp.ovpn" ]; then
+        VPN_SERVERS["canada"]="1085:105:tun5:ca-free-14.protonvpn.udp.ovpn::"
+        VPN_ORDER+=("canada")
+    fi
+    if [ -f "${VPN_DIR}/us-free-24.protonvpn.udp.ovpn" ]; then
+        VPN_SERVERS["us2"]="1086:106:tun6:us-free-24.protonvpn.udp.ovpn::"
+        VPN_ORDER+=("us2")
+    fi
+    if [ -f "${VPN_DIR}/us-free-26.protonvpn.udp.ovpn" ]; then
+        VPN_SERVERS["us3"]="1087:107:tun7:us-free-26.protonvpn.udp.ovpn::"
+        VPN_ORDER+=("us3")
+    fi
+    if [ -f "${VPN_DIR}/us-free-85.protonvpn.udp.ovpn" ]; then
+        VPN_SERVERS["us4"]="1088:108:tun8:us-free-85.protonvpn.udp.ovpn::"
+        VPN_ORDER+=("us4")
+    fi
+    if [ -f "${VPN_DIR}/mx-free-2.protonvpn.udp.ovpn" ]; then
+        VPN_SERVERS["mx2"]="1089:109:tun9:mx-free-2.protonvpn.udp.ovpn::"
+        VPN_ORDER+=("mx2")
+    fi
+    if [ -f "${VPN_DIR}/us-free-1.protonvpn.udp.ovpn" ]; then
+        VPN_SERVERS["us5"]="1090:110:tun10:us-free-1.protonvpn.udp.ovpn::"
+        VPN_ORDER+=("us5")
+    fi
+    if [ -f "${VPN_DIR}/nl-free-209.protonvpn.udp.ovpn" ]; then
+        VPN_SERVERS["nl2"]="1091:111:tun11:nl-free-209.protonvpn.udp.ovpn::"
+        VPN_ORDER+=("nl2")
+    fi
+}
+
+get_vpn_gateway() {
+    local TUN_DEV=$1
+    local VPN_NAME=$2
+    local GW=""
+    local elapsed=0
+
+    while [ "${elapsed}" -lt 30 ]; do
+        GW=$(grep -oP 'route_gateway \K[\d.]+' "${LOG_DIR}/${VPN_NAME}-openvpn.log" 2>/dev/null | tail -1)
+        if [ -n "${GW}" ]; then
+            echo "${GW}"
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    GW=$(ip route show dev "${TUN_DEV}" 2>/dev/null | grep -oP 'via \K[\d.]+' | head -1)
+    if [ -n "${GW}" ]; then
+        echo "${GW}"
+        return 0
+    fi
+
+    local TUN_IP=$(ip -4 addr show "${TUN_DEV}" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+    if [ -n "${TUN_IP}" ]; then
+        GW="${TUN_IP%.*}.1"
+        echo "${GW}"
+        return 0
+    fi
+
+    GW=$(grep -oP 'UDPv4 link remote: \[AF_INET\][\d.]+' "${LOG_DIR}/${VPN_NAME}-openvpn.log" 2>/dev/null | grep -oP '[\d.]+$' | tail -1)
+    if [ -n "${GW}" ]; then
+        echo "${GW}"
+        return 0
+    fi
+
+    echo -e "${RED}[${VPN_NAME}]${NC} ERROR: No se pudo detectar gateway VPN para ${TUN_DEV}" >&2
+    return 1
+}
+
+test_vpn_connectivity() {
+    local TUN_DEV=$1
+    local TIMEOUT=${2:-5}
+
+    if ! ip addr show "${TUN_DEV}" &>/dev/null; then
+        return 1
+    fi
+
+    if timeout "${TIMEOUT}" ping -I "${TUN_DEV}" -c 2 8.8.8.8 &>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+save_active_config() {
+    local VPN_NAME=$1
+    local OVPN_FILE=$2
+    echo "ACTIVE_${VPN_NAME^^}=\"${OVPN_FILE}\"" >> "${CONFIG_FILE}"
+}
+
+configure_routing_v3() {
+    local VPN_NAME=$1
+    local TUN_DEV=$2
+    local ROUTE_TABLE=$3
+    local PROXY_UID=$4
+    local VPN_GW=$5
+
+    local VPN_SUBNET=$(ip -4 addr show "${TUN_DEV}" | grep -oP '(?<=inet\s)\d+(\.\d+){3}/\d+')
+    ip route add ${VPN_SUBNET} dev ${TUN_DEV} scope link table ${ROUTE_TABLE} 2>/dev/null || true
+    ip route add default via ${VPN_GW} dev ${TUN_DEV} table ${ROUTE_TABLE} 2>/dev/null || true
+
+    while ip rule del fwmark ${ROUTE_TABLE} 2>/dev/null; do :; done
+    while ip rule del uidrange ${PROXY_UID}-${PROXY_UID} 2>/dev/null; do :; done
+
+    ip rule add uidrange ${PROXY_UID}-${PROXY_UID} table ${ROUTE_TABLE} priority $((10000 + ROUTE_TABLE))
+    iptables -t mangle -D OUTPUT -m owner --uid-owner ${PROXY_UID} -j MARK --set-mark ${ROUTE_TABLE} 2>/dev/null || true
+    iptables -t mangle -A OUTPUT -m owner --uid-owner ${PROXY_UID} -j MARK --set-mark ${ROUTE_TABLE}
+
+    ip rule add fwmark ${ROUTE_TABLE} table ${ROUTE_TABLE} priority $((11000 + ROUTE_TABLE)) 2>/dev/null || true
+}
+
+setup_vpn_proxy() {
+    local VPN_NAME=$1
+    local PRIMARY_OVPN=$2
+    local BACKUP_OVPN=$3
+    local PROXY_PORT=$4
+    local ROUTE_TABLE=$5
+    local TUN_DEV=$6
+    local PROXY_UID=$((3000 + ROUTE_TABLE))
+    local OVPN_FILE="${PRIMARY_OVPN}"
+    local SUCCESS=0
+
+    if ! id "vpnuser${ROUTE_TABLE}" &>/dev/null; then
+        useradd -r -s /bin/false -u "${PROXY_UID}" "vpnuser${ROUTE_TABLE}" 2>/dev/null || true
+    fi
+
+    for attempt in 1 2; do
+        if [ ! -f "${VPN_DIR}/${OVPN_FILE}" ]; then
+            if [ "${attempt}" -eq 1 ] && [ -n "${BACKUP_OVPN}" ]; then
+                OVPN_FILE="${BACKUP_OVPN}"
+                continue
+            else
+                return 1
+            fi
+        fi
+
+        local TEMP_OVPN="/tmp/${VPN_NAME}.ovpn"
+        local CREDS_FILE=$(grep "^auth-user-pass" "${VPN_DIR}/${OVPN_FILE}" | awk '{print $3}')
+        if [ -z "${CREDS_FILE}" ]; then
+            CREDS_FILE="${VPN_DIR}/credentials.txt"
+        fi
+
+        cp "${VPN_DIR}/${OVPN_FILE}" "${TEMP_OVPN}"
+        local CREDS_NAME=$(basename "${CREDS_FILE}")
+        cp "${CREDS_FILE}" "/tmp/${CREDS_NAME}"
+
+        sed -i "/^dev /d" "${TEMP_OVPN}"
+        echo "dev ${TUN_DEV}" >> "${TEMP_OVPN}"
+        echo "route-nopull" >> "${TEMP_OVPN}"
+        echo "pull-filter ignore \"dhcp-option DNS\"" >> "${TEMP_OVPN}"
+
+        openvpn --config "${TEMP_OVPN}" \
+            --daemon \
+            --writepid "${RUN_DIR}/openvpn-${VPN_NAME}.pid" \
+            --log "${LOG_DIR}/${VPN_NAME}-openvpn.log" \
+            --status "${LOG_DIR}/${VPN_NAME}-status.log" 10 \
+            --verb 4
+
+        for i in {1..30}; do
+            if ip addr show "${TUN_DEV}" &>/dev/null 2>&1; then
+                break
+            fi
+            sleep 1
+        done
+
+        if ! ip addr show "${TUN_DEV}" &>/dev/null 2>&1; then
+            rm -f "${TEMP_OVPN}"
+            if [ "${attempt}" -eq 1 ] && [ -n "${BACKUP_OVPN}" ]; then
+                OVPN_FILE="${BACKUP_OVPN}"
+                continue
+            else
+                return 1
+            fi
+        fi
+
+        if test_vpn_connectivity "${TUN_DEV}" 10; then
+            save_active_config "${VPN_NAME}" "${OVPN_FILE}"
+            rm -f "${TEMP_OVPN}"
+            SUCCESS=1
+            break
+        else
+            kill $(cat "${RUN_DIR}/openvpn-${VPN_NAME}.pid") 2>/dev/null || true
+            rm -f "${RUN_DIR}/openvpn-${VPN_NAME}.pid"
+            rm -f "${TEMP_OVPN}"
+            if [ "${attempt}" -eq 1 ] && [ -n "${BACKUP_OVPN}" ]; then
+                OVPN_FILE="${BACKUP_OVPN}"
+                sleep 3
+            else
+                return 1
+            fi
+        fi
+    done
+
+    if [ "${SUCCESS}" -eq 0 ]; then
+        return 1
+    fi
+
+    local VPN_GW
+    VPN_GW=$(get_vpn_gateway "${TUN_DEV}" "${VPN_NAME}") || return 1
+
+    configure_routing_v3 "${VPN_NAME}" "${TUN_DEV}" "${ROUTE_TABLE}" "${PROXY_UID}" "${VPN_GW}"
+
+    su -s /bin/bash "vpnuser${ROUTE_TABLE}" -c "microsocks -i 127.0.0.1 -p ${PROXY_PORT}" &
+    echo $! > "${RUN_DIR}/microsocks-${VPN_NAME}.pid"
+
+    for i in {1..30}; do
+        if netstat -tln 2>/dev/null | grep -q ":${PROXY_PORT} "; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
+cleanup_vpn() {
+    local VPN_NAME=$1
+    local ROUTE_TABLE=$2
+    local PROXY_PORT=$3
+    local PROXY_UID=$((3000 + ROUTE_TABLE))
+
+    if [ -f "${RUN_DIR}/microsocks-${VPN_NAME}.pid" ]; then
+        kill -9 $(cat "${RUN_DIR}/microsocks-${VPN_NAME}.pid") 2>/dev/null || true
+        rm -f "${RUN_DIR}/microsocks-${VPN_NAME}.pid"
+    fi
+
+    pkill -9 -U "${PROXY_UID}" 2>/dev/null || true
+
+    if [ -f "${RUN_DIR}/openvpn-${VPN_NAME}.pid" ]; then
+        OVPN_PID=$(cat "${RUN_DIR}/openvpn-${VPN_NAME}.pid" 2>/dev/null)
+        if [ -n "${OVPN_PID}" ] && kill -0 "${OVPN_PID}" 2>/dev/null; then
+            kill -TERM "${OVPN_PID}" 2>/dev/null || true
+            local waited=0
+            while kill -0 "${OVPN_PID}" 2>/dev/null && [ "${waited}" -lt 10 ]; do
+                sleep 1
+                waited=$((waited + 1))
+            done
+            if kill -0 "${OVPN_PID}" 2>/dev/null; then
+                kill -KILL "${OVPN_PID}" 2>/dev/null || true
+            fi
+        fi
+        rm -f "${RUN_DIR}/openvpn-${VPN_NAME}.pid"
+    fi
+
+    iptables -t mangle -D OUTPUT -m owner --uid-owner "${PROXY_UID}" -j MARK --set-mark "${ROUTE_TABLE}" 2>/dev/null || true
+    rm -f "/tmp/${VPN_NAME}.ovpn" "/tmp/credentials"*.txt 2>/dev/null || true
+
+    while ip rule del fwmark "${ROUTE_TABLE}" 2>/dev/null; do :; done
+    while ip rule del uidrange "${PROXY_UID}-${PROXY_UID}" 2>/dev/null; do :; done
+    ip route flush table "${ROUTE_TABLE}" 2>/dev/null || true
+}
+
+show_status() {
+    echo "==============================="
+    echo "VPN Status"
+    echo "==============================="
+    if [ -f "${CONFIG_FILE}" ]; then
+        source "${CONFIG_FILE}"
+    fi
+
+    for VPN_NAME in "${VPN_ORDER[@]}"; do
+        IFS=':' read -r PROXY_PORT ROUTE_TABLE TUN_DEV PRIMARY BACKUP1 BACKUP2 <<< "${VPN_SERVERS[$VPN_NAME]}"
+        local PID_FILE="${RUN_DIR}/openvpn-${VPN_NAME}.pid"
+
+        if [ -f "${PID_FILE}" ] && ps -p $(cat "${PID_FILE}") > /dev/null 2>&1; then
+            echo -e "${GREEN}✓${NC} ${VPN_NAME} running"
+            if ip addr show "${TUN_DEV}" &>/dev/null 2>&1; then
+                TUN_IP=$(ip -4 addr show "${TUN_DEV}" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+                echo "  Interface: ${TUN_DEV} (${TUN_IP})"
+            fi
+            if netstat -tln 2>/dev/null | grep -q ":${PROXY_PORT} "; then
+                echo "  Proxy: 127.0.0.1:${PROXY_PORT}"
+                IP=$(timeout 10 curl --socks5 127.0.0.1:${PROXY_PORT} -s https://ifconfig.me 2>/dev/null || true)
+                [ -n "${IP}" ] && echo "  Public IP: ${IP}"
+            fi
+        fi
+    done
+
+    NORMAL_IP=$(timeout 5 curl -s https://ifconfig.me 2>/dev/null || true)
+    echo "Direct IP: ${NORMAL_IP:-unknown}"
+}
+
+start_system() {
+    echo -e "${YELLOW}[CLEANUP]${NC} Limpiando reglas anteriores..."
+    pkill -f openvpn 2>/dev/null || true
+    pkill -f microsocks 2>/dev/null || true
+
+    for uid in 3100 3101 3102 3103 3104 3105 3106 3107 3108 3109 3110 3111; do
+        while ip rule del uidrange ${uid}-${uid} 2>/dev/null; do :; done
+    done
+
+    for table in 100 101 102 103 104 105 106 107 108 109 110 111; do
+        while ip rule del fwmark ${table} 2>/dev/null; do :; done
+        ip route flush table ${table} 2>/dev/null || true
+    done
+
+    rm -f "${CONFIG_FILE}" "${RUN_DIR}"/openvpn-*.pid "${RUN_DIR}"/microsocks-*.pid 2>/dev/null || true
+
+    discover_vpn_servers
+
+    for VPN_NAME in "${VPN_ORDER[@]}"; do
+        IFS=':' read -r PORT TABLE TUN PRIMARY BACKUP1 BACKUP2 <<< "${VPN_SERVERS[$VPN_NAME]}"
+        setup_vpn_proxy "${VPN_NAME}" "${PRIMARY}" "${BACKUP1}" "${PORT}" "${TABLE}" "${TUN}" || {
+            echo -e "${RED}[ERROR]${NC} No se pudo iniciar ${VPN_NAME}"
+        }
+    done
+
+    show_status
+}
+
+stop_system() {
+    echo "Deteniendo VPNs..."
+    discover_vpn_servers
+    for VPN_NAME in "${VPN_ORDER[@]}"; do
+        IFS=':' read -r PORT TABLE TUN PRIMARY BACKUP1 BACKUP2 <<< "${VPN_SERVERS[$VPN_NAME]}"
+        cleanup_vpn "${VPN_NAME}" "${TABLE}" "${PORT}"
+    done
+    pkill -f microsocks 2>/dev/null || true
+    pkill -f openvpn 2>/dev/null || true
+    rm -f "${CONFIG_FILE}"
+}
+
+test_system() {
+    discover_vpn_servers
+    for VPN_NAME in "${VPN_ORDER[@]}"; do
+        IFS=':' read -r PORT TABLE TUN PRIMARY BACKUP1 BACKUP2 <<< "${VPN_SERVERS[$VPN_NAME]}"
+        echo -n "Probando ${VPN_NAME} (${PORT})... "
+        IP=$(timeout 15 curl --socks5 127.0.0.1:${PORT} -s https://ifconfig.me 2>/dev/null || true)
+        if [ -n "${IP}" ]; then
+            echo -e "${GREEN}✓${NC} ${IP}"
+        else
+            echo -e "${RED}✗${NC}"
+        fi
+    done
+}
+
+show_help() {
+    echo "VPN Multi-Proxy Script"
+    echo ""
+    echo "Uso:"
+    echo "  $0 install"
+    echo "  $0 full"
+    echo "  $0 start"
+    echo "  $0 stop"
+    echo "  $0 restart"
+    echo "  $0 status"
+    echo "  $0 test"
+    echo "  $0 help"
+}
+
+case "${1:-help}" in
+    install)
+        detect_distro
+        install_dependencies
+        setup_directories
+        integrate_credentials
+        create_users
+        log_success "Instalación completada"
+        ;;
+    full)
+        detect_distro
+        cleanup_system
+        install_dependencies
+        setup_directories
+        integrate_credentials
+        create_users
+        log_success "Instalación completa finalizada"
+        ;;
+    start)
+        start_system
+        ;;
+    stop)
+        stop_system
+        ;;
+    restart)
+        stop_system
+        sleep 3
+        start_system
+        ;;
+    status)
+        discover_vpn_servers
+        show_status
+        ;;
+    test)
+        test_system
+        ;;
+    help|--help|-h|"")
+        show_help
+        ;;
+    *)
+        log_error "Comando desconocido: $1"
+        show_help
+        exit 1
+        ;;
+esac
